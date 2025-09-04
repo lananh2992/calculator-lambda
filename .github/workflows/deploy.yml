@@ -1,40 +1,85 @@
-name: Deploy Calculator Lambda
+name: CI/CD Lambda Calculator on LocalStack
 
 on:
   push:
-    branches:
-      - main
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
 
 jobs:
-  deploy:
+  test-localstack:
     runs-on: ubuntu-latest
 
+    services:
+      localstack:
+        image: localstack/localstack:latest
+        ports:
+          - 4566:4566
+        env:
+          SERVICES: lambda
+          DEBUG: 1
+        options: >-
+          --health-cmd="curl -s http://localhost:4566/_localstack/health | grep '\"initialized\": true'"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=20
+
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v3
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.9"
+          python-version: '3.10'
 
-      - name: Install AWS CLI
-        run: pip install awscli
+      - name: Install dependencies
+        run: |
+          pip install awscli awscli-local
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
 
       - name: Package Lambda
         run: |
-          mkdir package
-          if [ -s requirements.txt ]; then pip install -r requirements.txt --target ./package; fi
-          cp lambda_function.py package/
-          cd package
-          zip -r ../function.zip .
+            # Crée un dossier temporaire pour toutes les dépendances
+            mkdir -p build
+            cp lambda_function.py build/
+            pip install -r requirements.txt -t build/
+            cd build
+            zip -r ../function.zip .
+            cd ..
 
-      - name: Deploy to AWS Lambda
+      - name: Deploy Lambda to LocalStack
         run: |
-          aws lambda update-function-code \
-            --function-name ${{ secrets.LAMBDA_FUNCTION_NAME }} \
+          # Supprime la Lambda si elle existe déjà
+          awslocal lambda delete-function --function-name calculator || true
+          awslocal lambda create-function \
+            --function-name calculator \
+            --runtime python3.10 \
+            --handler lambda_function.lambda_handler \
             --zip-file fileb://function.zip \
-            --region ${{ secrets.AWS_REGION }}
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+            --role arn:aws:iam::000000000000:role/lambda-ex
+
+      - name: Test Lambda operations
+        run: |
+          declare -A tests
+          tests["add"]='{"num1":"2","num2":"3","operation":"add"}:5'
+          tests["subtract"]='{"num1":"5","num2":"3","operation":"subtract"}:2'
+          tests["multiply"]='{"num1":"4","num2":"3","operation":"multiply"}:12'
+          tests["divide"]='{"num1":"10","num2":"2","operation":"divide"}:5'
+
+          for key in "${!tests[@]}"; do
+            IFS=':' read -r payload expected <<< "${tests[$key]}"
+            echo "$payload" > event.json
+            awslocal lambda invoke \
+              --function-name calculator \
+              --payload file://event.json \
+              response.json
+            result=$(jq -r '.body' response.json)
+            echo "Testing $key: expected $expected, got $result"
+            if [[ "$result" != "$expected" ]]; then
+              echo "Test $key failed!"
+              exit 1
+            fi
+          done
