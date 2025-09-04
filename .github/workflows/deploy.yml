@@ -113,10 +113,28 @@ jobs:
           ROLE_ARN=$(awslocal iam get-role --role-name lambda-ex | jq -r '.Role.Arn')
           awslocal lambda create-function \
             --function-name "$FUNC_NAME" \
-            --runtime python3.10 \
+            --runtime python3.11 \
             --handler lambda_function.lambda_handler \
             --zip-file fileb://function.zip \
             --role "$ROLE_ARN"
+
+      - name: Wait for function to be Active
+        run: |
+          echo "Waiting for Lambda function state to be Active..."
+          for i in {1..60}; do
+            conf=$(awslocal lambda get-function-configuration --function-name "$FUNC_NAME")
+            state=$(echo "$conf" | jq -r '.State // empty')
+            last=$(echo "$conf" | jq -r '.LastUpdateStatus // empty')
+            echo "State=$state  LastUpdateStatus=$last"
+            if [ "$state" = "Active" ] && [ "$last" = "Successful" ]; then
+              echo "Function is Active."
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Function did not become Active in time:"
+          awslocal lambda get-function-configuration --function-name "$FUNC_NAME" || true
+          exit 1
 
       - name: Verify function exists (post-deploy)
         run: |
@@ -149,15 +167,9 @@ jobs:
       - name: Debug – print LocalStack logs
         if: failure()
         run: |
-          echo "=== Docker ps ==="
-          docker ps -a
-          echo "=== Find localstack container logs ==="
-          ID=$(docker ps -aq --filter "ancestor=localstack/localstack")
-          if [ -n "$ID" ]; then
-            for cid in $ID; do
-              echo "=== Logs for $cid ==="
-              docker logs "$cid" --tail 300 || true
-            done
-          else
-            echo "No localstack container found by ancestor filter."
-          fi
+          echo "=== Function configuration ==="
+          awslocal lambda get-function-configuration --function-name "$FUNC_NAME" || true
+          echo "=== CloudWatch logs (if any) ==="
+          awslocal logs describe-log-streams --log-group-name "/aws/lambda/$FUNC_NAME" || true
+          awslocal logs tail "/aws/lambda/$FUNC_NAME" --since 10m || true
+

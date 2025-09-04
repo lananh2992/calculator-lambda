@@ -1,9 +1,5 @@
-import json
-import os
-import time
-import boto3
-import botocore
-import pytest
+# tests/integration/test_invoke_localstack.py
+import json, os, time, boto3, botocore, pytest
 
 LOCALSTACK_URL = os.getenv("LOCALSTACK_URL", "http://localhost:4566")
 REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
@@ -23,22 +19,23 @@ def wait_lambda_api(timeout=60):
             time.sleep(1)
     raise TimeoutError("Lambda API not ready in LocalStack")
 
-def wait_function_exists(func_name: str, timeout=60):
+def wait_function_active(func_name: str, timeout=60):
     cli = lambda_client()
     start = time.time()
     while time.time() - start < timeout:
         try:
-            cli.get_function(FunctionName=func_name)
-            return
+            conf = cli.get_function_configuration(FunctionName=func_name)
+            state = conf.get("State")
+            last = conf.get("LastUpdateStatus")
+            if state == "Active" and last == "Successful":
+                return
+            time.sleep(1)
         except botocore.exceptions.ClientError as e:
-            # Not found yet
             if e.response.get("Error", {}).get("Code") in {"ResourceNotFoundException", "404"}:
                 time.sleep(1)
                 continue
             raise
-        except Exception:
-            time.sleep(1)
-    raise TimeoutError(f"Function {func_name} not found in LocalStack")
+    raise TimeoutError(f"Function {func_name} not Active in LocalStack")
 
 @pytest.mark.parametrize("payload, expected", [
     ({"num1":"2","num2":"3","operation":"add"},       5),
@@ -48,17 +45,10 @@ def wait_function_exists(func_name: str, timeout=60):
 ])
 def test_lambda_integration(payload, expected):
     wait_lambda_api()
-    wait_function_exists(FUNC_NAME)
-
+    wait_function_active(FUNC_NAME)
     cli = lambda_client()
-    try:
-        resp = cli.invoke(FunctionName=FUNC_NAME, Payload=json.dumps(payload).encode())
-    except Exception as e:
-        pytest.fail(f"Invoke failed: {type(e).__name__}: {e}")
-
+    resp = cli.invoke(FunctionName=FUNC_NAME, Payload=json.dumps(payload).encode())
     assert resp["StatusCode"] == 200
-    # La payload de Lambda est un stream bytes → dict de ta Lambda
-    body_envelope = json.loads(resp["Payload"].read().decode())
-    # Ta Lambda renvoie {"statusCode":..., "headers":..., "body": "<json>"}
-    data = json.loads(body_envelope["body"])
+    envelope = json.loads(resp["Payload"].read().decode())
+    data = json.loads(envelope["body"])
     assert data["result"] == expected
