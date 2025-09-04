@@ -17,6 +17,7 @@ jobs:
       AWS_DEFAULT_REGION: us-east-1
       LOCALSTACK_URL: http://localhost:4566
       FUNC_NAME: calculator
+      PYTHONPATH: ${{ github.workspace }}
 
     services:
       localstack:
@@ -45,10 +46,15 @@ jobs:
       - name: Install tooling & deps
         run: |
           pip install --upgrade pip
-          pip install awscli awscli-local jq pytest
+          pip install awscli awscli-local jq pytest boto3
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           fi
+
+      - name: Debug workspace layout
+        run: |
+          echo "Workspace:" && pwd
+          echo "Tree:" && ls -la
 
       # ---- UNIT TESTS (sans AWS/LocalStack) ----
       - name: Run unit tests
@@ -87,7 +93,8 @@ jobs:
             echo "Not ready yet (lambda) – try $i ..."
             sleep 2
           done
-          echo "LocalStack never became ready."; exit 1
+          echo "LocalStack never became ready."
+          exit 1
 
       # ---- DEPLOY TO LOCALSTACK ----
       - name: Create dummy IAM role (LocalStack)

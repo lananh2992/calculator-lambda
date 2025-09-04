@@ -2,15 +2,14 @@ import json
 import pytest
 from lambda_function import lambda_handler
 
-def parse_body(resp):
-    assert "statusCode" in resp
-    body = resp.get("body")
-    # Le handler renvoie toujours un JSON stringifié
+def parse_response(resp):
+    """Parse et retourne (statusCode, body_json)"""
+    status = resp.get("statusCode")
     try:
-      data = json.loads(body)
+        body = json.loads(resp.get("body", "{}"))
     except Exception:
-      pytest.fail(f"Body not JSON: {body}")
-    return resp["statusCode"], data
+        body = resp.get("body")
+    return status, body
 
 @pytest.mark.parametrize("payload, expected", [
     ({"num1":"2","num2":"3","operation":"add"},       5),
@@ -18,26 +17,26 @@ def parse_body(resp):
     ({"num1":"4","num2":"3","operation":"multiply"}, 12),
     ({"num1":"10","num2":"2","operation":"divide"},   5),
 ])
-def test_ok_operations(payload, expected):
+def test_valid_operations(payload, expected):
     resp = lambda_handler(payload, None)
-    status, data = parse_body(resp)
+    status, body = parse_response(resp)
     assert status == 200
-    assert data["result"] == expected
+    assert body["result"] == expected
 
 def test_divide_by_zero():
     resp = lambda_handler({"num1":"1","num2":"0","operation":"divide"}, None)
-    status, data = parse_body(resp)
+    status, body = parse_response(resp)
     assert status == 400
-    assert data["error"] == "Cannot divide by zero"
+    assert body["error"] == "Cannot divide by zero"
 
 def test_invalid_operation():
     resp = lambda_handler({"num1":"1","num2":"2","operation":"pow"}, None)
-    status, data = parse_body(resp)
+    status, body = parse_response(resp)
     assert status == 400
-    assert data["error"] == "Invalid operation"
+    assert body["error"] == "Invalid operation"
 
 def test_invalid_numbers():
-    resp = lambda_handler({"num1":"x","num2":"2","operation":"add"}, None)
-    status, data = parse_body(resp)
+    resp = lambda_handler({"num1":"abc","num2":"2","operation":"add"}, None)
+    status, body = parse_response(resp)
     assert status == 400
-    assert data["error"] == "Invalid numbers"
+    assert body["error"] == "Invalid numbers"
