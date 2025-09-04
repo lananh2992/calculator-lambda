@@ -118,6 +118,20 @@ jobs:
             --zip-file fileb://function.zip \
             --role "$ROLE_ARN"
 
+      - name: Verify function exists (post-deploy)
+        run: |
+          echo "Verifying Lambda function presence..."
+          for i in {1..30}; do
+            if awslocal lambda get-function --function-name "$FUNC_NAME" >/dev/null 2>&1; then
+              echo "Function $FUNC_NAME is available."
+              exit 0
+            fi
+            echo "Function not visible yet, retry $i..."
+            sleep 2
+          done
+          echo "Function $FUNC_NAME not found after deploy."
+          exit 1
+
       # ---- INTEGRATION TESTS (contre LocalStack) ----
       - name: Run integration tests (LocalStack)
         if: ${{ hashFiles('tests/integration/**/*.py') != '' }}
