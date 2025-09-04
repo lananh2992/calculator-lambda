@@ -12,9 +12,7 @@ jobs:
 
     services:
       localstack:
-        image: localstack/localstack:latest
-        ports:
-          - 4567:4566
+        image: localstack/localstack:0.14.0
         env:
           SERVICES: lambda
           DEBUG: 1
@@ -35,17 +33,18 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install awscli awscli-local
+          pip install awscli awscli-local jq
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           fi
 
       - name: Package Lambda
         run: |
-            # Crée un dossier temporaire pour toutes les dépendances
             mkdir -p build
             cp lambda_function.py build/
-            pip install -r requirements.txt -t build/
+            if [ -f requirements.txt ]; then
+              pip install -r requirements.txt -t build/
+            fi
             cd build
             zip -r ../function.zip .
             cd ..
@@ -61,7 +60,6 @@ jobs:
 
       - name: Deploy Lambda to LocalStack
         run: |
-          # Supprime la Lambda si elle existe déjà
           awslocal lambda delete-function --function-name calculator || true
           awslocal lambda create-function \
             --function-name calculator \
