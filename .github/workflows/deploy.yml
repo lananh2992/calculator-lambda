@@ -10,29 +10,41 @@ jobs:
   test-localstack:
     runs-on: ubuntu-latest
 
+    env:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      LOCALSTACK_HOST: localhost
+      LOCALSTACK_EDGE_PORT: "4566"
+
     services:
       localstack:
-        image: localstack/localstack:0.14.0
+        image: localstack/localstack:stable
         env:
-          SERVICES: lambda
-          DEBUG: 1
+          SERVICES: lambda,iam,cloudwatch,logs
+          DEBUG: "1"
+          AWS_DEFAULT_REGION: us-east-1
         options: >-
           --health-cmd="curl -s http://localhost:4566/_localstack/health | grep '\"initialized\": true'"
           --health-interval=10s
           --health-timeout=5s
-          --health-retries=20
-    
+          --health-retries=30
+        ports:
+          - 4566:4566
+
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install tooling & deps
         run: |
+          pip install --upgrade pip
           pip install awscli awscli-local jq
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
@@ -40,36 +52,52 @@ jobs:
 
       - name: Package Lambda
         run: |
-            mkdir -p build
-            cp lambda_function.py build/
-            if [ -f requirements.txt ]; then
-              pip install -r requirements.txt -t build/
-            fi
-            cd build
-            zip -r ../function.zip .
-            cd ..
+          rm -rf build function.zip
+          mkdir -p build
+          cp lambda_function.py build/
+          if [ -s requirements.txt ]; then
+            pip install -r requirements.txt -t build/
+          fi
+          (cd build && zip -r ../function.zip .)
+          ls -lh function.zip
 
       - name: Wait for LocalStack to be ready
         run: |
-          echo "Waiting for LocalStack..."
-          until awslocal lambda list-functions >/dev/null 2>&1; do
-            echo "LocalStack not ready yet, waiting 5s..."
+          echo "Waiting for LocalStack on http://localhost:4566 ..."
+          for i in {1..60}; do
+            if curl -s http://localhost:4566/_localstack/health | grep -q '"initialized": true'; then
+              echo "LocalStack is ready!"
+              break
+            fi
+            echo "Not ready yet, sleeping 5s..."
             sleep 5
           done
-          echo "LocalStack is ready!"
+
+      - name: Create dummy IAM role (LocalStack)
+        run: |
+          set -e
+          ROLE_NAME=lambda-ex
+          POLICY_DOC='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+          awslocal iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1 || \
+            awslocal iam create-role --role-name "$ROLE_NAME" --assume-role-policy-document "$POLICY_DOC"
+          # Policy logs basique (optionnelle)
+          awslocal iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole || true
 
       - name: Deploy Lambda to LocalStack
         run: |
+          set -e
           awslocal lambda delete-function --function-name calculator || true
+          ROLE_ARN=$(awslocal iam get-role --role-name lambda-ex | jq -r '.Role.Arn')
           awslocal lambda create-function \
             --function-name calculator \
             --runtime python3.10 \
             --handler lambda_function.lambda_handler \
             --zip-file fileb://function.zip \
-            --role arn:aws:iam::000000000000:role/lambda-ex
+            --role "$ROLE_ARN"
 
       - name: Test Lambda operations
         run: |
+          set -e
           declare -A tests
           tests["add"]='{"num1":"2","num2":"3","operation":"add"}:5'
           tests["subtract"]='{"num1":"5","num2":"3","operation":"subtract"}:2'
@@ -78,15 +106,30 @@ jobs:
 
           for key in "${!tests[@]}"; do
             IFS=':' read -r payload expected <<< "${tests[$key]}"
-            echo "$payload" > event.json
+            printf '%s' "$payload" > event.json
             awslocal lambda invoke \
               --function-name calculator \
               --payload file://event.json \
-              response.json
-            result=$(jq -r '.body' response.json)
+              response.json >/dev/null
+
+            # Récupère le champ "result" depuis le body JSON
+            result=$(jq -r '.body | fromjson | .result' response.json)
+
             echo "Testing $key: expected $expected, got $result"
-            if [[ "$result" != "$expected" ]]; then
+            # Comparaison numérique robuste (gère 5 vs 5.0)
+            awk -v a="$result" -v b="$expected" 'BEGIN{exit (a==b)?0:1}' || { 
               echo "Test $key failed!"
+              echo "Full response:"; cat response.json
               exit 1
-            fi
+            }
           done
+          echo "All tests passed ✅"
+
+      - name: Upload artifacts (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-ci-artifacts
+          path: |
+            function.zip
+            response.json
