@@ -5,6 +5,7 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
   test-localstack:
@@ -14,23 +15,22 @@ jobs:
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
       AWS_DEFAULT_REGION: us-east-1
-      LOCALSTACK_HOST: localhost
-      LOCALSTACK_EDGE_PORT: "4566"
+      LOCALSTACK_URL: http://localhost:4566
+      FUNC_NAME: calculator
 
     services:
       localstack:
         image: localstack/localstack:stable
         env:
           SERVICES: lambda,iam,cloudwatch,logs
+          # Exécuter Lambda SANS docker-in-docker
+          LAMBDA_RUNTIME_EXECUTOR: local
+          LAMBDA_EXECUTOR: local
           DEBUG: "1"
           AWS_DEFAULT_REGION: us-east-1
-        options: >-
-          --health-cmd="curl -s http://localhost:4566/_localstack/health | grep '\"initialized\": true'"
-          --health-interval=10s
-          --health-timeout=5s
-          --health-retries=30
         ports:
           - 4566:4566
+        # Pas de healthcheck Docker : on attend nous-mêmes dans un step
 
     steps:
       - name: Checkout repository
@@ -45,11 +45,17 @@ jobs:
       - name: Install tooling & deps
         run: |
           pip install --upgrade pip
-          pip install awscli awscli-local jq
+          pip install awscli awscli-local jq pytest
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           fi
 
+      # ---- UNIT TESTS (sans AWS/LocalStack) ----
+      - name: Run unit tests
+        if: ${{ hashFiles('tests/unit/**/*.py') != '' }}
+        run: pytest -q tests/unit
+
+      # ---- PACKAGE ZIP ----
       - name: Package Lambda
         run: |
           rm -rf build function.zip
@@ -61,18 +67,29 @@ jobs:
           (cd build && zip -r ../function.zip .)
           ls -lh function.zip
 
+      # ---- WAIT LOCALSTACK ----
       - name: Wait for LocalStack to be ready
         run: |
-          echo "Waiting for LocalStack on http://localhost:4566 ..."
-          for i in {1..60}; do
-            if curl -s http://localhost:4566/_localstack/health | grep -q '"initialized": true'; then
-              echo "LocalStack is ready!"
+          echo "Waiting for LocalStack on $LOCALSTACK_URL ..."
+          for i in {1..90}; do
+            if curl -fsS "$LOCALSTACK_URL/_localstack/health" | jq . >/dev/null 2>&1; then
+              echo "LocalStack health endpoint responded."
               break
             fi
-            echo "Not ready yet, sleeping 5s..."
-            sleep 5
+            echo "Not ready yet (health) – try $i ..."
+            sleep 2
           done
+          for i in {1..60}; do
+            if awslocal lambda list-functions >/dev/null 2>&1; then
+              echo "Lambda API reachable via awslocal."
+              exit 0
+            fi
+            echo "Not ready yet (lambda) – try $i ..."
+            sleep 2
+          done
+          echo "LocalStack never became ready."; exit 1
 
+      # ---- DEPLOY TO LOCALSTACK ----
       - name: Create dummy IAM role (LocalStack)
         run: |
           set -e
@@ -80,50 +97,24 @@ jobs:
           POLICY_DOC='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
           awslocal iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1 || \
             awslocal iam create-role --role-name "$ROLE_NAME" --assume-role-policy-document "$POLICY_DOC"
-          # Policy logs basique (optionnelle)
           awslocal iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole || true
 
       - name: Deploy Lambda to LocalStack
         run: |
           set -e
-          awslocal lambda delete-function --function-name calculator || true
+          awslocal lambda delete-function --function-name "$FUNC_NAME" || true
           ROLE_ARN=$(awslocal iam get-role --role-name lambda-ex | jq -r '.Role.Arn')
           awslocal lambda create-function \
-            --function-name calculator \
+            --function-name "$FUNC_NAME" \
             --runtime python3.10 \
             --handler lambda_function.lambda_handler \
             --zip-file fileb://function.zip \
             --role "$ROLE_ARN"
 
-      - name: Test Lambda operations
-        run: |
-          set -e
-          declare -A tests
-          tests["add"]='{"num1":"2","num2":"3","operation":"add"}:5'
-          tests["subtract"]='{"num1":"5","num2":"3","operation":"subtract"}:2'
-          tests["multiply"]='{"num1":"4","num2":"3","operation":"multiply"}:12'
-          tests["divide"]='{"num1":"10","num2":"2","operation":"divide"}:5'
-
-          for key in "${!tests[@]}"; do
-            IFS=':' read -r payload expected <<< "${tests[$key]}"
-            printf '%s' "$payload" > event.json
-            awslocal lambda invoke \
-              --function-name calculator \
-              --payload file://event.json \
-              response.json >/dev/null
-
-            # Récupère le champ "result" depuis le body JSON
-            result=$(jq -r '.body | fromjson | .result' response.json)
-
-            echo "Testing $key: expected $expected, got $result"
-            # Comparaison numérique robuste (gère 5 vs 5.0)
-            awk -v a="$result" -v b="$expected" 'BEGIN{exit (a==b)?0:1}' || { 
-              echo "Test $key failed!"
-              echo "Full response:"; cat response.json
-              exit 1
-            }
-          done
-          echo "All tests passed ✅"
+      # ---- INTEGRATION TESTS (contre LocalStack) ----
+      - name: Run integration tests (LocalStack)
+        if: ${{ hashFiles('tests/integration/**/*.py') != '' }}
+        run: pytest -q tests/integration
 
       - name: Upload artifacts (optional)
         if: always()
@@ -132,4 +123,20 @@ jobs:
           name: lambda-ci-artifacts
           path: |
             function.zip
-            response.json
+
+      # ---- DEBUG LOGS SI ÉCHEC ----
+      - name: Debug – print LocalStack logs
+        if: failure()
+        run: |
+          echo "=== Docker ps ==="
+          docker ps -a
+          echo "=== Find localstack container logs ==="
+          ID=$(docker ps -aq --filter "ancestor=localstack/localstack")
+          if [ -n "$ID" ]; then
+            for cid in $ID; do
+              echo "=== Logs for $cid ==="
+              docker logs "$cid" --tail 300 || true
+            done
+          else
+            echo "No localstack container found by ancestor filter."
+          fi
